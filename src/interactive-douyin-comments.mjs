@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
@@ -12,6 +14,12 @@ import {
   MAX_INTERACTIVE_REPLY_CHARS,
   normalizeInteractiveDecision
 } from "./lib/interactive-comment-protocol.mjs";
+import { InteractiveDecisionInbox } from "./lib/interactive-decision-inbox.mjs";
+import {
+  getInteractiveWorkOutputPath,
+  loadInteractiveWorkQueue,
+  summarizeInteractiveWorkResults
+} from "./lib/interactive-work-queue.mjs";
 
 const DEFAULT_DECISION_TIMEOUT_SECONDS = 600;
 
@@ -37,8 +45,13 @@ Options:
   --skip-unreplied-filter      Scan all comments; page/ledger checks still apply
   --work-publish-text <text>   Disambiguate works with similar titles
   --out <path>                 Checkpoint/result JSON path
+  --works-file <path>          Process works[] from one JSON file in this process
+  --max-works <n>              Max works read from --works-file (default: 10)
+  --out-dir <path>             Per-work output directory for --works-file
+  --decision-dir <path>        File inbox fallback when background stdin closes
+  --total-timeout <ms>         Stop starting works after this total runtime
   --profile <path>             Playwright profile path
-  --timeout <ms>               Max total runtime
+  --timeout <ms>               Max runtime for each work
   --headless                   Run Chromium in headless mode (visible by default)
   --debug                      Print debug logs to stderr
   --help                       Print this help
@@ -56,7 +69,12 @@ function parseArgs(argv) {
     preview: false,
     noHistory: false,
     skipUnrepliedFilter: false,
-    outputPath: DEFAULT_INTERACTIVE_OUTPUT_PATH
+    outputPath: DEFAULT_INTERACTIVE_OUTPUT_PATH,
+    worksFile: "",
+    maxWorks: 10,
+    outputDirectory: path.dirname(DEFAULT_INTERACTIVE_OUTPUT_PATH),
+    decisionDirectory: "",
+    totalTimeoutMs: 0
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -107,6 +125,26 @@ function parseArgs(argv) {
         args.outputPath = path.resolve(argv[index + 1] ?? DEFAULT_INTERACTIVE_OUTPUT_PATH);
         index += 1;
         break;
+      case "--works-file":
+        args.worksFile = path.resolve(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--max-works":
+        args.maxWorks = toPositiveInteger(argv[index + 1], "--max-works");
+        index += 1;
+        break;
+      case "--out-dir":
+        args.outputDirectory = path.resolve(argv[index + 1] ?? path.dirname(args.outputPath));
+        index += 1;
+        break;
+      case "--decision-dir":
+        args.decisionDirectory = path.resolve(argv[index + 1] ?? "");
+        index += 1;
+        break;
+      case "--total-timeout":
+        args.totalTimeoutMs = toPositiveInteger(argv[index + 1], "--total-timeout");
+        index += 1;
+        break;
       default:
         if (!arg.startsWith("-") && !args.workTitle) {
           args.workTitle = normalizeText(arg);
@@ -129,14 +167,18 @@ function emitProtocol(type, payload = {}) {
   process.stdout.write(`${JSON.stringify(createProtocolEvent(type, payload))}\n`);
 }
 
-function createDecisionReceiver(lineIterator, timeoutMs) {
+function createDecisionReceiver(decisionInbox, timeoutMs, decisionRunDirectory = "") {
   return async (request) => {
+    const decisionPath = decisionRunDirectory
+      ? path.join(decisionRunDirectory, `${request.requestId}.json`)
+      : "";
     emitProtocol("comment_found", {
       requestId: request.requestId,
       sequence: request.sequence,
       selectedWork: request.selectedWork,
       routing: request.routing,
       comment: request.comment,
+      decisionPath: decisionPath || undefined,
       decisionSchema: {
         reply: {
           requestId: request.requestId,
@@ -160,25 +202,19 @@ function createDecisionReceiver(lineIterator, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const remainingMs = Math.max(1, deadline - Date.now());
-      let timer;
-      const lineResult = await Promise.race([
-        lineIterator.next(),
-        new Promise((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`Decision timed out after ${timeoutMs}ms.`)),
-            remainingMs
-          );
-        })
-      ]).finally(() => clearTimeout(timer));
+      const decisionInput = await decisionInbox.next({
+        decisionPath,
+        timeoutMs: remainingMs
+      });
 
-      if (lineResult.done) {
+      if (decisionInput.done) {
         return {
           action: "stop",
           reason: "stdin_closed"
         };
       }
 
-      const line = String(lineResult.value ?? "").trim();
+      const line = String(decisionInput.value ?? "").trim();
       if (!line) {
         continue;
       }
@@ -203,8 +239,13 @@ async function main() {
     printHelp();
     return;
   }
-  if (!args.workTitle) {
-    throw new Error('Missing work title. Usage: npm run comments:interactive -- "作品短标题"');
+  if (!args.workTitle && !args.worksFile) {
+    throw new Error(
+      'Missing work title or --works-file. Usage: npm run comments:interactive -- "作品短标题"'
+    );
+  }
+  if (args.workTitle && args.worksFile) {
+    throw new Error("Use either one work title or --works-file, not both.");
   }
 
   // stdout 保持为机器可解析的 JSONL；浏览器与数据库诊断统一写到 stderr。
@@ -214,39 +255,129 @@ async function main() {
     crlfDelay: Infinity,
     terminal: false
   });
+  const lineIterator = lines[Symbol.asyncIterator]();
+  const decisionInbox = new InteractiveDecisionInbox(lineIterator);
+  const decisionRunDirectory = args.decisionDirectory
+    ? path.join(args.decisionDirectory, crypto.randomUUID())
+    : "";
+  if (decisionRunDirectory) {
+    fs.mkdirSync(decisionRunDirectory, { recursive: true, mode: 0o700 });
+  }
+  const requestDecision = createDecisionReceiver(
+    decisionInbox,
+    args.decisionTimeoutMs,
+    decisionRunDirectory
+  );
+  const queuedWorks = args.worksFile
+    ? loadInteractiveWorkQueue(args.worksFile, args.maxWorks).works
+    : [{ title: args.workTitle, publishText: args.workPublishText }];
+  const isWorkQueue = Boolean(args.worksFile);
+  const startedAt = Date.now();
+  const workResults = [];
+  let queueExitReason = "all_works_complete";
 
   try {
-    const result = await interactiveComments({
-      ...args,
-      requestDecision: createDecisionReceiver(
-        lines[Symbol.asyncIterator](),
-        args.decisionTimeoutMs
-      ),
-      onReady: ({ selectedWork, outputPath }) => {
-        emitProtocol("ready", {
-          selectedWork,
-          outputPath,
-          mode: args.mode,
-          preview: args.preview,
-          decisionLimit: args.limit
+    for (let workIndex = 0; workIndex < queuedWorks.length; workIndex += 1) {
+      const queuedWork = queuedWorks[workIndex];
+      const elapsedMs = Date.now() - startedAt;
+      const remainingTotalMs = args.totalTimeoutMs
+        ? Math.max(0, args.totalTimeoutMs - elapsedMs)
+        : 0;
+      if (args.totalTimeoutMs && remainingTotalMs === 0) {
+        queueExitReason = "total_timeout_before_next_work";
+        break;
+      }
+
+      const workTimeoutMs = args.totalTimeoutMs
+        ? args.timeoutMs
+          ? Math.min(args.timeoutMs, remainingTotalMs)
+          : remainingTotalMs
+        : args.timeoutMs;
+      const workOptions = {
+        ...args,
+        workTitle: queuedWork.title,
+        workPublishText: queuedWork.publishText,
+        outputPath: isWorkQueue
+          ? getInteractiveWorkOutputPath(args.outputDirectory, workIndex)
+          : args.outputPath,
+        timeoutMs: workTimeoutMs,
+        requestDecision,
+        onReady: ({ selectedWork, outputPath }) => {
+          emitProtocol(isWorkQueue ? "work_ready" : "ready", {
+            workIndex: workIndex + 1,
+            workCount: queuedWorks.length,
+            selectedWork,
+            outputPath,
+            mode: args.mode,
+            preview: args.preview,
+            decisionLimit: args.limit
+          });
+        },
+        onProgress: ({ latestResult, summary }) => {
+          emitProtocol("result", {
+            workIndex: workIndex + 1,
+            workCount: queuedWorks.length,
+            requestId: latestResult.requestId,
+            result: latestResult,
+            summary: compactSummary(summary)
+          });
+          if (isWorkQueue && latestResult.status === "sent_unconfirmed") {
+            throw new Error(
+              "sent_unconfirmed: reply was clicked but page confirmation was unavailable; stopping the work queue without retry."
+            );
+          }
+        }
+      };
+
+      let result;
+      try {
+        result = await interactiveComments(workOptions);
+      } catch (error) {
+        emitProtocol("fatal", {
+          workIndex: workIndex + 1,
+          workCount: queuedWorks.length,
+          queuedWork,
+          error: error instanceof Error ? error.message : String(error)
         });
-      },
-      onProgress: ({ latestResult, summary }) => {
-        emitProtocol("result", {
-          requestId: latestResult.requestId,
-          result: latestResult,
-          summary: compactSummary(summary)
+        process.exitCode = 1;
+        return;
+      }
+
+      workResults.push(result);
+      if (isWorkQueue) {
+        emitProtocol("work_complete", {
+          workIndex: workIndex + 1,
+          workCount: queuedWorks.length,
+          outputPath: result.outputPath,
+          selectedWork: result.selectedWork,
+          summary: compactSummary(result)
         });
       }
-    });
+      if (result.exitReason === "stopped_by_decision") {
+        queueExitReason = "stopped_by_decision";
+        break;
+      }
+    }
 
-    emitProtocol("complete", {
-      outputPath: result.outputPath,
-      selectedWork: result.selectedWork,
-      summary: compactSummary(result)
-    });
+    if (isWorkQueue) {
+      emitProtocol("complete", {
+        worksFile: args.worksFile,
+        outputDirectory: args.outputDirectory,
+        summary: summarizeInteractiveWorkResults(workResults, queueExitReason)
+      });
+    } else {
+      const [result] = workResults;
+      emitProtocol("complete", {
+        outputPath: result.outputPath,
+        selectedWork: result.selectedWork,
+        summary: compactSummary(result)
+      });
+    }
   } finally {
     lines.close();
+    if (decisionRunDirectory) {
+      fs.rmSync(decisionRunDirectory, { recursive: true, force: true });
+    }
   }
 }
 

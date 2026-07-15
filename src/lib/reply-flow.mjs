@@ -94,6 +94,38 @@ function commentTextsMatch(left, right) {
   );
 }
 
+function findCurrentInteractiveComment(snapshot, originalComment) {
+  const exactMatch = snapshot.find(
+    (comment) => comment.signature && comment.signature === originalComment.signature
+  );
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const originalUsername = normalizeUsername(originalComment.username).toLowerCase();
+  const candidates = snapshot.filter((comment) => {
+    return (
+      normalizeUsername(comment.username).toLowerCase() === originalUsername &&
+      commentTextsMatch(comment.commentText, originalComment.commentText)
+    );
+  });
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const originalPublishText = normalizeText(originalComment.publishText);
+  if (originalPublishText) {
+    const publishMatches = candidates.filter(
+      (comment) => normalizeText(comment.publishText) === originalPublishText
+    );
+    if (publishMatches.length === 1) {
+      return publishMatches[0];
+    }
+  }
+
+  return null;
+}
+
 function matchReplyPlan(comment, replyPlans, processedPlanIds, visibleUsernameCounts) {
   if (!Array.isArray(replyPlans) || replyPlans.length === 0) {
     return null;
@@ -922,10 +954,47 @@ export async function processCommentsInteractively(page, options) {
         continue;
       }
 
+      // 模型决策可能需要几十秒，期间前端会重绘评论列表并移除旧 data 标记。
+      // 发送前重新做快照，按评论身份找到当前 DOM，避免对陈旧 locator 操作超时。
+      const refreshedSnapshot = await extractCommentSnapshot(page);
+      const currentComment = findCurrentInteractiveComment(refreshedSnapshot, comment);
+      if (!currentComment) {
+        await appendResult(
+          {
+            ...baseResult,
+            status: "error",
+            errorStage: "refresh_after_decision",
+            error: "comment_disappeared_or_became_ambiguous_before_reply",
+            requestedReplyMessage: decision.replyMessage,
+            decisionReason: decision.reason
+          },
+          { requestId, routing }
+        );
+        continue;
+      }
+      state.processedSignatures.add(currentComment.signature);
+
+      if (currentComment.hasReplies) {
+        await persistPageReplyMarker(currentComment, options);
+        await appendResult(
+          {
+            username: currentComment.username,
+            commentText: currentComment.commentText,
+            publishText: currentComment.publishText,
+            status: "skipped_already_replied",
+            pageReplyEvidence: {
+              replyCount: currentComment.replyCount
+            }
+          },
+          { requestId, routing }
+        );
+        continue;
+      }
+
       const commentLocator = page
-        .locator(`[data-codex-comment-block="${comment.domIndex}"]`)
+        .locator(`[data-codex-comment-block="${currentComment.domIndex}"]`)
         .first();
-      const replyResult = await safeReplyToComment(page, commentLocator, comment, {
+      const replyResult = await safeReplyToComment(page, commentLocator, currentComment, {
         ...options,
         replyMessage: decision.replyMessage,
         replyDryRun: false
@@ -938,7 +1007,7 @@ export async function processCommentsInteractively(page, options) {
 
       if (typeof options.afterReplyResult === "function") {
         await options.afterReplyResult({
-          comment,
+          comment: currentComment,
           decision,
           result: completedResult
         });

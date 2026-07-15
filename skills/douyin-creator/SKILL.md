@@ -8,6 +8,8 @@ metadata: { "openclaw": { "requires": { "bins": ["node", "npm", "npx"] } } }
 
 用仓库 `douyin-creator-tools` 的 CLI 完成作品列表、评论导出、逐条模型决策回复和 JSON 批量回复。不要自己用 Playwright 重写。
 
+所有命令共用一个登录档案，必须严格串行。全程最多运行一个抖音命令；前一个进程退出前不得启动下一个。出现 `DOUYIN_BROWSER_BUSY` 时立即结束本轮，不等待、不重试、不杀进程，也不要删除 `.openclaw-browser.lock` 或任何 `Singleton*` 文件。
+
 ## 项目根
 
 `$PROJECT_DIR = ~/.openclaw/douyin-creator-tools`（仓库固定 clone 到此位置）。
@@ -70,6 +72,8 @@ cd "$PROJECT_DIR" && npm run --silent comments:interactive -- --mode smart --lim
 
 也可写 `skip` 或 `stop`。必须等待当前 `result` 后再处理下一条；`sent_unconfirmed` 不得重试。用 `--preview` 只生成候选回复、不发送。没有 `process` 工具时不要启动此命令，改用批量流程。
 
+定时巡检必须使用本逐条流程。多个作品使用一次 `comments:interactive --works-file <works.json> --max-works 10 --out-dir <目录> --decision-dir <目录>`，让同一个后台进程自动串行处理；`comment_found` 含 `decisionPath` 时用 `write` 工具把当前决定 JSON 写到该路径，`work_complete` 后继续轮询同一 `sessionId`，最终 `complete` 才结束。不要为每个作品分别调用 `exec`，也不要使用“逐个导出，再批量回复”的旧流程。
+
 ## 工作流 4：批量回复
 
 流程：导出 JSON → 在每条 `replyMessage` 填文案 → 把 JSON 路径传给 `comments:reply`。
@@ -85,3 +89,9 @@ cd "$PROJECT_DIR" && npm run comments:reply -- /abs/path/to/comments.json
 3. `replyMessage` 为 `""` 的条目会被跳过
 4. 回复文本里的引号用中文 `""`，别用未转义的英文 `"`
 5. 不要加 `status` / `appliedReplyMessage` 字段，那是结果字段，执行时会被覆盖
+
+## 浏览器并发约束
+
+- 复用 `.playwright/douyin-profile`，不要清空或替换登录态目录。
+- 不删除 `.openclaw-browser.lock` 或 Chrome 的 `SingletonLock` / `SingletonSocket` / `SingletonCookie`；程序只会自动清理可确认失效的残留锁。
+- 多作品、导出和回复都必须串行，不能预启动下一个浏览器命令。

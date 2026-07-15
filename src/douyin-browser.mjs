@@ -2,6 +2,10 @@ import path from "node:path";
 import process from "node:process";
 import readline from "node:readline/promises";
 import { chromium } from "playwright";
+import {
+  acquireBrowserSessionLock,
+  attachBrowserSessionCleanup
+} from "./lib/browser-session-lock.mjs";
 
 export const DEFAULT_COMMENT_PAGE_URL =
   "https://creator.douyin.com/creator-micro/interactive/comment";
@@ -38,6 +42,8 @@ export async function launchPersistentPage(options = {}) {
     alwaysNewPage = false
   } = options;
 
+  const resolvedUserDataDir = path.resolve(userDataDir);
+  const browserReservation = acquireBrowserSessionLock(resolvedUserDataDir);
   const launchOptions = { headless };
   if (viewport) {
     launchOptions.viewport = viewport;
@@ -45,14 +51,21 @@ export async function launchPersistentPage(options = {}) {
     launchOptions.viewport = null;
   }
 
-  const context = await chromium.launchPersistentContext(userDataDir, launchOptions);
-  const page = alwaysNewPage
-    ? await context.newPage()
-    : (context.pages()[0] ?? (await context.newPage()));
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(resolvedUserDataDir, launchOptions);
+    attachBrowserSessionCleanup(context, browserReservation);
+    const page = alwaysNewPage
+      ? await context.newPage()
+      : (context.pages()[0] ?? (await context.newPage()));
 
-  await page.bringToFront().catch(() => {});
-
-  return { context, page };
+    await page.bringToFront().catch(() => {});
+    return { context, page };
+  } catch (error) {
+    await context?.close().catch(() => {});
+    browserReservation.release();
+    throw error;
+  }
 }
 
 export async function gotoPage(page, pageUrl, navigationTimeoutMs = 60000) {

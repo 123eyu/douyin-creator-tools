@@ -59,6 +59,20 @@ npm run --silent comments:interactive -- --mode smart --limit 10 "作品完整�
 
 浏览器默认可见。用 `--preview` 只验证逐条决策而不输入或发送；完整协议见 `npm run comments:interactive -- --help`。批量导出/回复命令继续保留，适合人工预审或更低 token 成本的场景。
 
+定时巡检多个作品时，用一个进程承载完整队列，避免调度模型误开多个后台会话：
+
+```bash
+npm run --silent comments:interactive -- --headless --mode smart --works-file /absolute/path/to/works.json --max-works 10 --out-dir comments-output/cron-interactive --decision-dir /absolute/path/to/decision-inbox --timeout 180000 --total-timeout 1020000
+```
+
+队列会为每个作品输出 `work_ready` / `work_complete`，发现评论时仍输出 `comment_found` 并等待模型决定；所有作品结束后只输出一次最终 `complete`。整个过程始终复用同一个 stdout JSONL 会话。指定 `--decision-dir` 后，`comment_found.decisionPath` 提供随机的一次性回调文件；模型可直接写入决定 JSON，即使后台 stdin 已关闭也能继续。
+
+### 浏览器单实例保护
+
+所有命令共用同一个持久登录档案，因此项目会先原子获取 `.playwright/douyin-profile.openclaw-browser.lock`，确保同一时刻最多启动一个 Chromium。第二个任务会立即以 `DOUYIN_BROWSER_BUSY` 退出，不等待也不抢占；这让定时任务可以安全跳过本轮，避免多窗口互相阻塞。
+
+进程正常结束或收到 `SIGINT` / `SIGTERM` / `SIGHUP` 时会先关闭浏览器并释放项目锁。下次启动只会自动删除能够确认所属 PID 已结束的项目锁和 Chrome `Singleton*` 残留。不要用 `rm` 手工删除这些锁；活跃浏览器的锁被删除后会再次造成多个实例同时操作登录档案。
+
 ### 回复去重保护
 
 回复流程会同时检查数据库、独立追加式台账和网页上的回复标记。独立台账位于
@@ -71,6 +85,7 @@ npm run --silent comments:interactive -- --mode smart --limit 10 "作品完整�
 
 - 不绕过登录、验证码、平台风控
 - 复用 `.playwright/douyin-profile`，**不要清空或替换**登录态目录
+- 不手工删除 `.openclaw-browser.lock` 或 Chrome 的 `SingletonLock` / `SingletonSocket` / `SingletonCookie`
 - 页面结构变化导致命令失败时，让用户先人工核查，**不要改 `src/` 代码去"修复"**
 - 不生成引流、外链、联系方式、敏感词等违规内容
 - Agent 绝不替用户扫码登录

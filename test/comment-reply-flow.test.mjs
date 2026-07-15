@@ -289,6 +289,50 @@ test("交互流程逐条请求决策并在确认后继续", async () => {
   }
 });
 
+test("模型决策期间页面重绘后重新定位当前评论再回复", async () => {
+  const browser = await chromium.launch({ headless: true });
+  const options = {
+    ...buildReplyOptions(),
+    replyPlans: undefined,
+    decisionLimit: 1,
+    interactiveMode: "smart",
+    preview: false
+  };
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(buildCommentHtml({ includeSendButton: true }));
+
+    const summary = await processCommentsInteractively(page, {
+      ...options,
+      requestDecision: async (request) => {
+        await page.setContent(buildCommentHtml({ includeSendButton: true }));
+        await page.locator("#send-test").evaluate((sendButton) => {
+          window.__rerenderSendClickCount = 0;
+          sendButton.addEventListener("click", () => {
+            window.__rerenderSendClickCount += 1;
+            const replyThread = document.createElement("div");
+            replyThread.textContent = "查看1条回复";
+            sendButton.parentElement?.append(replyThread);
+          });
+        });
+        return {
+          requestId: request.requestId,
+          action: "reply",
+          replyMessage: "页面重绘后仍能回复",
+          reason: "测试重新定位"
+        };
+      }
+    });
+
+    assert.equal(summary.results[0].status, "replied");
+    assert.equal(summary.repliedCount, 1);
+    assert.equal(await page.evaluate(() => window.__rerenderSendClickCount), 1);
+  } finally {
+    await browser.close();
+  }
+});
+
 test("交互流程在页面已有回复时不会调用模型", async () => {
   const browser = await chromium.launch({ headless: true });
   const options = {

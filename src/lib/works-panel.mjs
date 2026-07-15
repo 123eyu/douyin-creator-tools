@@ -480,6 +480,23 @@ function findVisibleTargetWork(works, workTitle, workPublishText = "") {
     }
   }
 
+  if (workPublishText) {
+    const normalizedPublishText = normalizeLookupText(workPublishText);
+    const publishMatches = normalizedPublishText
+      ? works.filter((work) => {
+          const publishText = normalizeLookupText(work.publishText);
+          return Boolean(publishText) && publishText === normalizedPublishText;
+        })
+      : [];
+    if (publishMatches.length === 1) {
+      return {
+        matchedWork: publishMatches[0],
+        matchMode: "unique_publish_text",
+        partialTitleMatchCount: partialTitleMatches.length
+      };
+    }
+  }
+
   return {
     matchedWork: null,
     matchMode: "",
@@ -766,6 +783,19 @@ function pickTargetWork(works, workTitle, workPublishText = "") {
 
     if (publishMatched.length === 1) {
       return publishMatched[0];
+    }
+  }
+
+  if (workPublishText) {
+    const normalizedPublishText = normalizeLookupText(workPublishText);
+    const publishMatches = normalizedPublishText
+      ? works.filter((work) => {
+          const publishText = normalizeLookupText(work.publishText);
+          return Boolean(publishText) && publishText === normalizedPublishText;
+        })
+      : [];
+    if (publishMatches.length === 1) {
+      return publishMatches[0];
     }
   }
 
