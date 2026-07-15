@@ -1,13 +1,12 @@
 ---
 name: douyin-creator
-description: "抖音（Douyin）创作者中心作品与评论自动化：获取已发布作品列表、导出指定作品的未回复评论、按 JSON 批量回复评论。当用户提到 抖音 / Douyin / 创作者中心 / 作品列表 / 导出评论 / 回复评论 / 未回复评论 / 批量回复 时触发。"
-user-invocable: true
-metadata: {"openclaw":{"requires":{"bins":["node","npm","npx"]}}}
+description: "抖音（Douyin）创作者中心作品与评论自动化：获取已发布作品列表、导出指定作品的未回复评论、让模型逐条决策回复或按 JSON 批量回复。当用户提到抖音、创作者中心、作品列表、导出评论、回复评论、逐条回复、未回复评论或批量回复时触发。"
+metadata: { "openclaw": { "requires": { "bins": ["node", "npm", "npx"] } } }
 ---
 
 # douyin-creator
 
-用仓库 `douyin-creator-tools` 的 CLI 完成三件事：作品列表、导出未回复评论、按 JSON 批量回复。不要自己用 Playwright 重写。用户提到这三件事以外的抖音需求时，告知"本 skill 只处理作品列表、评论导出、批量回复"。
+用仓库 `douyin-creator-tools` 的 CLI 完成作品列表、评论导出、逐条模型决策回复和 JSON 批量回复。不要自己用 Playwright 重写。
 
 ## 项目根
 
@@ -55,7 +54,23 @@ cd "$PROJECT_DIR" && npm run comments:export -- "<作品标题>"
 
 `imagePaths` 仅在评论带图时出现。`replyMessage` 初始为空字符串。
 
-## 工作流 3：批量回复
+## 工作流 3：逐条模型决策回复（默认）
+
+当前会话同时有 `exec` 与 `process` 工具时，启动非 PTY 后台进程：
+
+```bash
+cd "$PROJECT_DIR" && npm run --silent comments:interactive -- --mode smart --limit 10 "<作品标题>"
+```
+
+用 `background: true`、`timeout: 0` 启动并保存 `sessionId`。每收到一个 `comment_found` JSONL 事件，只思考当前 `comment`；查看可选 `imagePaths`，把 `history` 仅作背景。再用 `process write` 写回一行：
+
+```json
+{ "requestId": "原样返回", "action": "reply", "replyMessage": "不超过400字", "reason": "简短依据" }
+```
+
+也可写 `skip` 或 `stop`。必须等待当前 `result` 后再处理下一条；`sent_unconfirmed` 不得重试。用 `--preview` 只生成候选回复、不发送。没有 `process` 工具时不要启动此命令，改用批量流程。
+
+## 工作流 4：批量回复
 
 流程：导出 JSON → 在每条 `replyMessage` 填文案 → 把 JSON 路径传给 `comments:reply`。
 

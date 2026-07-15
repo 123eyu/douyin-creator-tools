@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import crypto from "node:crypto";
 import path from "node:path";
 import {
   DEFAULT_COMMENT_PAGE_URL,
@@ -7,14 +5,19 @@ import {
   launchPersistentPage,
   promptForEnter
 } from "./douyin-browser.mjs";
-import { getEffectiveTimeout, setReplyFilterDebugEnabled } from "./lib/common.mjs";
+import {
+  getEffectiveTimeout,
+  sanitizeCollectedComment,
+  setReplyFilterDebugEnabled
+} from "./lib/common.mjs";
+import { downloadCommentImages } from "./lib/comment-images.mjs";
 import { ensureCommentPageReady, hardRefreshPage } from "./lib/comment-page.mjs";
 import {
   captureCommentListFingerprint,
   collectComments,
   waitForCommentListChange
 } from "./lib/comment-ops.mjs";
-import { replyToComments } from "./lib/reply-flow.mjs";
+import { processCommentsInteractively, replyToComments } from "./lib/reply-flow.mjs";
 import { emitResult, loadReplyCommentsFile } from "./lib/result-store.mjs";
 import {
   fetchAllWorksWithRetry,
@@ -51,6 +54,9 @@ export const DEFAULT_WORKS_OUTPUT_PATH = path.resolve("comments-output/list-work
 export const DEFAULT_EXPORT_OUTPUT_PATH = path.resolve("comments-output/unreplied-comments.json");
 export const DEFAULT_EXPORT_ALL_OUTPUT_PATH = path.resolve("comments-output/all-comments.json");
 export const DEFAULT_REPLY_OUTPUT_PATH = path.resolve("comments-output/reply-comments-result.json");
+export const DEFAULT_INTERACTIVE_OUTPUT_PATH = path.resolve(
+  "comments-output/interactive-comments-result.json"
+);
 
 function buildRuntimeBudget(totalTimeoutMs = 0) {
   if (!totalTimeoutMs) {
@@ -138,70 +144,6 @@ function syncReplyLedgerFromDatabase(options = {}) {
   }
 }
 
-function extractExtFromUrl(url) {
-  try {
-    const pathname = new URL(url).pathname;
-    const match = pathname.match(/\.(\w+)$/);
-    return match ? `.${match[1]}` : ".jpg";
-  } catch {
-    return ".jpg";
-  }
-}
-
-async function downloadCommentImages(comments, outputPath) {
-  const hasImages = comments.some((c) => c.imageUrls?.length > 0);
-  if (!hasImages) return;
-
-  const imageDir = path.resolve(path.dirname(outputPath), "comment-images");
-  await fs.promises.mkdir(imageDir, { recursive: true });
-
-  let downloaded = 0;
-  let failed = 0;
-
-  for (const comment of comments) {
-    if (!comment.imageUrls?.length) continue;
-    const savedPaths = [];
-
-    for (let i = 0; i < comment.imageUrls.length; i++) {
-      const url = comment.imageUrls[i];
-      try {
-        const response = await globalThis.fetch(url);
-        if (!response.ok) {
-          console.warn(`[image] 下载失败 (HTTP ${response.status}): ${url.slice(0, 100)}…`);
-          failed += 1;
-          continue;
-        }
-
-        const buffer = Buffer.from(await response.arrayBuffer());
-        const ext = extractExtFromUrl(url);
-        const hash = crypto.createHash("md5").update(url).digest("hex").slice(0, 8);
-        const safeName = comment.username.replace(/[^\w\u4e00-\u9fff-]/g, "_").slice(0, 20);
-        const filename = `${safeName}_${i}_${hash}${ext}`;
-        const filePath = path.resolve(imageDir, filename);
-
-        await fs.promises.writeFile(filePath, buffer);
-        savedPaths.push(filePath);
-        downloaded += 1;
-      } catch (err) {
-        console.warn(`[image] 下载异常: ${err?.message ?? err}`);
-        failed += 1;
-      }
-    }
-
-    delete comment.imageUrls;
-    if (savedPaths.length > 0) {
-      comment.imagePaths = savedPaths;
-    }
-  }
-
-  if (downloaded > 0) {
-    console.log(`[image] 已下载 ${downloaded} 张评论图片至 ${imageDir}`);
-  }
-  if (failed > 0) {
-    console.warn(`[image] ${failed} 张图片下载失败`);
-  }
-}
-
 async function openCommentSession(options = {}) {
   setReplyFilterDebugEnabled(options.debug);
 
@@ -220,11 +162,17 @@ async function openCommentSession(options = {}) {
     getEffectiveTimeout(runtimeBudget, DEFAULT_NAVIGATION_TIMEOUT_MS)
   );
 
-  await ensureCommentPageReady(page, options.pageUrl || DEFAULT_COMMENT_PAGE_URL, {
-    ...runtimeBudget,
-    navigationTimeoutMs: DEFAULT_NAVIGATION_TIMEOUT_MS,
-    uiTimeoutMs: DEFAULT_UI_TIMEOUT_MS
-  });
+  try {
+    await ensureCommentPageReady(page, options.pageUrl || DEFAULT_COMMENT_PAGE_URL, {
+      ...runtimeBudget,
+      navigationTimeoutMs: DEFAULT_NAVIGATION_TIMEOUT_MS,
+      uiTimeoutMs: DEFAULT_UI_TIMEOUT_MS,
+      promptForLogin: options.promptForLogin
+    });
+  } catch (error) {
+    await context.close().catch(() => {});
+    throw error;
+  }
 
   return {
     context,
@@ -476,6 +424,181 @@ export async function exportAllComments(options = {}) {
     } catch (dbError) {
       console.warn(`[db] 写入评论失败（不影响主流程）: ${dbError?.message ?? dbError}`);
     }
+  } finally {
+    await context.close();
+  }
+}
+
+export async function interactiveComments(options = {}) {
+  if (!options.workTitle) {
+    throw new Error('Missing work title. Usage: npm run comments:interactive -- "作品短标题"');
+  }
+  if (typeof options.requestDecision !== "function") {
+    throw new Error("Interactive comments require a requestDecision callback.");
+  }
+
+  syncReplyLedgerFromDatabase(options);
+
+  const outputPath = options.outputPath || DEFAULT_INTERACTIVE_OUTPUT_PATH;
+  const decisionLimit = options.limit || DEFAULT_REPLY_LIMIT;
+  const decisionTimeoutMs = Math.max(1000, Number(options.decisionTimeoutMs) || 600000);
+  const interactiveFlowTimeoutMs = Math.min(
+    12 * 60 * 60 * 1000,
+    Math.max(
+      DEFAULT_REPLY_FLOW_TIMEOUT_MS,
+      60000 + decisionLimit * (decisionTimeoutMs + DEFAULT_REPLY_TIMEOUT_MS)
+    )
+  );
+  // stdin 是逐条 JSONL 决策通道，登录失效时不能再用它等待人工按 Enter。
+  const { context, page, runtimeBudget } = await openCommentSession({
+    ...options,
+    promptForLogin: false
+  });
+
+  try {
+    const targetWork = await resolveTargetWork(
+      page,
+      runtimeBudget,
+      options.workTitle,
+      options.workPublishText || ""
+    );
+    const selectedWork = getSelectedWorkOutput(targetWork) ?? {
+      title: options.workTitle,
+      publishText: options.workPublishText || ""
+    };
+    console.log(`已选中作品：${selectedWork.title}`);
+
+    if (typeof options.onReady === "function") {
+      await options.onReady({
+        selectedWork,
+        outputPath: path.resolve(outputPath)
+      });
+    }
+
+    let databaseChecksEnabled = true;
+    let historyChecksEnabled = !options.noHistory;
+    const getKnownReplyEvidence = (comment) => {
+      if (!databaseChecksEnabled) {
+        return null;
+      }
+
+      try {
+        const replyCountMap = getReplyCountMap(selectedWork.title, [comment]);
+        const replyCount = replyCountMap.get(`${comment.username}|||${comment.commentText}`) ?? 0;
+        return {
+          replied: replyCount >= 1,
+          replyCount
+        };
+      } catch (error) {
+        databaseChecksEnabled = false;
+        console.warn(
+          `[db] 逐条回复检查失败，后续继续依赖页面和独立台账: ${error?.message ?? error}`
+        );
+        return null;
+      }
+    };
+
+    const enrichComment = async (comment) => {
+      const enrichedComment = sanitizeCollectedComment(comment);
+      let history = [];
+
+      if (historyChecksEnabled) {
+        try {
+          history = getUserHistoryMap([comment.username]).get(comment.username) ?? [];
+        } catch (error) {
+          historyChecksEnabled = false;
+          console.warn(`[db] 用户历史查询失败，后续不再查询: ${error?.message ?? error}`);
+        }
+      }
+
+      try {
+        upsertComments(selectedWork.title, [
+          {
+            username: comment.username,
+            commentText: comment.commentText,
+            commentTime: comment.publishText || null,
+            replyMessage: null
+          }
+        ]);
+      } catch (error) {
+        console.warn(`[db] 当前评论写入失败（不影响交互流程）: ${error?.message ?? error}`);
+      }
+
+      const imageDownload = await downloadCommentImages([enrichedComment], outputPath);
+      if (imageDownload.failed > 0) {
+        enrichedComment.imageDownload = imageDownload;
+      }
+      if (!options.noHistory) {
+        enrichedComment.history = history;
+      }
+      return enrichedComment;
+    };
+
+    const afterReplyResult = ({ comment, decision, result }) => {
+      if (result.status !== "replied" && result.status !== "sent_unconfirmed") {
+        return;
+      }
+
+      try {
+        upsertComments(selectedWork.title, [
+          {
+            username: comment.username,
+            commentText: comment.commentText,
+            commentTime: comment.publishText || null,
+            replyMessage: decision.replyMessage
+          }
+        ]);
+        if (result.status === "replied") {
+          incrementReplyCount(selectedWork.title, comment.username, comment.commentText);
+        }
+      } catch (error) {
+        // 独立台账已在点击发送前写入；数据库故障不能使已发送评论失去去重保护。
+        console.warn(`[db] 交互回复结果写入失败（台账仍有效）: ${error?.message ?? error}`);
+      }
+    };
+
+    const buildOutput = (summary) => ({
+      fetchedAt: new Date().toISOString(),
+      mode: "interactive_comments",
+      interactiveMode: options.mode || "smart",
+      pageUrl: options.pageUrl || DEFAULT_COMMENT_PAGE_URL,
+      selectedWork,
+      preview: Boolean(options.preview),
+      ...summary
+    });
+
+    const replySummary = await processCommentsInteractively(page, {
+      ...runtimeBudget,
+      selectedWork,
+      decisionLimit,
+      interactiveMode: options.mode || "smart",
+      preview: Boolean(options.preview),
+      requestDecision: options.requestDecision,
+      onProgress: async (progress) => {
+        await emitResult(buildOutput(progress.summary), outputPath);
+        if (typeof options.onProgress === "function") {
+          await options.onProgress(progress);
+        }
+      },
+      getKnownReplyEvidence,
+      enrichComment,
+      afterReplyResult,
+      replyTimeoutMs: DEFAULT_REPLY_TIMEOUT_MS,
+      replySettleMs: DEFAULT_REPLY_SETTLE_MS,
+      replyTypeDelayMs: DEFAULT_REPLY_TYPE_DELAY_MS,
+      timeoutMs: interactiveFlowTimeoutMs,
+      idleMs: DEFAULT_COMMENTS_IDLE_MS,
+      uiTimeoutMs: DEFAULT_UI_TIMEOUT_MS,
+      skipUnrepliedFilter: Boolean(options.skipUnrepliedFilter),
+      replyLedgerPath: options.replyLedgerPath
+    });
+
+    const output = buildOutput(replySummary);
+    await emitResult(output, outputPath);
+    return {
+      outputPath: path.resolve(outputPath),
+      ...output
+    };
   } finally {
     await context.close();
   }

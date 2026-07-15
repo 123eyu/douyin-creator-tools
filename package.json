@@ -21,6 +21,7 @@
     "works": "node ./src/list-douyin-works.mjs",
     "comments:export": "node ./src/export-douyin-comments.mjs",
     "comments:export-all": "node ./src/export-all-douyin-comments.mjs",
+    "comments:interactive": "node ./src/interactive-douyin-comments.mjs",
     "comments:reply": "node ./src/reply-douyin-comments.mjs",
     "users": "node ./src/users.mjs",
     "article:publish": "node ./src/publish-douyin-article.mjs",

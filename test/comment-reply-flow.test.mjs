@@ -4,8 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { chromium } from "playwright";
-import { replyToComments } from "../src/lib/reply-flow.mjs";
+import { processCommentsInteractively, replyToComments } from "../src/lib/reply-flow.mjs";
 import { extractCommentSnapshot } from "../src/lib/comment-snapshot.mjs";
+import { ensureCommentPageReady } from "../src/lib/comment-page.mjs";
 import {
   backfillReplyLedgerEvents,
   getReplyLedgerEntry,
@@ -226,4 +227,116 @@ test("同一评论只能取得一次发送占位", () => {
   assert.equal(duplicate.reserved, false);
   assert.equal(duplicate.reason, "existing_entry");
   assert.equal(duplicate.existingEntry.status, "send_attempted");
+});
+
+test("交互流程逐条请求决策并在确认后继续", async () => {
+  const browser = await chromium.launch({ headless: true });
+  const options = {
+    ...buildReplyOptions(),
+    replyPlans: undefined,
+    decisionLimit: 1,
+    interactiveMode: "smart",
+    preview: false
+  };
+  const requests = [];
+  const progress = [];
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(buildCommentHtml({ includeSendButton: true }));
+    await page.locator("#send-test").evaluate((sendButton) => {
+      window.__interactiveSendClickCount = 0;
+      sendButton.addEventListener("click", () => {
+        window.__interactiveSendClickCount += 1;
+        const replyThread = document.createElement("div");
+        replyThread.textContent = "查看1条回复";
+        sendButton.parentElement?.append(replyThread);
+      });
+    });
+
+    const summary = await processCommentsInteractively(page, {
+      ...options,
+      requestDecision: (request) => {
+        requests.push(request);
+        return {
+          requestId: request.requestId,
+          action: "reply",
+          replyMessage: "这是逐条生成的回复",
+          reason: "测试回调"
+        };
+      },
+      onProgress: (event) => progress.push(event)
+    });
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].comment.username, "测试用户");
+    assert.equal(requests[0].comment.commentText, "这是一条测试评论");
+    assert.equal(requests[0].routing.route, "normal");
+    assert.equal(summary.exitReason, "decision_limit_reached");
+    assert.equal(summary.decisionCount, 1);
+    assert.equal(summary.actedCount, 1);
+    assert.equal(summary.repliedCount, 1);
+    assert.equal(summary.results[0].status, "replied");
+    assert.equal(summary.results[0].appliedReplyMessage, "这是逐条生成的回复");
+    assert.equal(progress.length, 1);
+    assert.equal(await page.evaluate(() => window.__interactiveSendClickCount), 1);
+    assert.equal(
+      getReplyLedgerEntry("测试作品", "测试用户", "这是一条测试评论", options)?.status,
+      "replied"
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test("交互流程在页面已有回复时不会调用模型", async () => {
+  const browser = await chromium.launch({ headless: true });
+  const options = {
+    ...buildReplyOptions(),
+    decisionLimit: 1,
+    interactiveMode: "smart"
+  };
+  let decisionCalls = 0;
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(buildCommentHtml({ replyThreadText: "查看1条回复" }));
+
+    const summary = await processCommentsInteractively(page, {
+      ...options,
+      requestDecision: () => {
+        decisionCalls += 1;
+        return { action: "stop" };
+      }
+    });
+
+    assert.equal(decisionCalls, 0);
+    assert.equal(summary.decisionCount, 0);
+    assert.equal(summary.repliedCount, 0);
+    assert.equal(summary.results[0].status, "skipped_already_replied");
+    assert.equal(
+      getReplyLedgerEntry("测试作品", "测试用户", "这是一条测试评论", options)?.status,
+      "page_replied"
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test("交互协议占用 stdin 时登录失效直接报错而不等待 Enter", async () => {
+  const browser = await chromium.launch({ headless: true });
+
+  try {
+    const page = await browser.newPage();
+    await assert.rejects(
+      ensureCommentPageReady(page, "data:text/html,<main>not logged in</main>", {
+        navigationTimeoutMs: 1000,
+        uiTimeoutMs: 100,
+        promptForLogin: false
+      }),
+      /请先运行 npm run auth/
+    );
+  } finally {
+    await browser.close();
+  }
 });

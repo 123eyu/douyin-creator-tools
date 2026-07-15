@@ -21,6 +21,11 @@ import {
   recordReplyLedgerEvent,
   reserveReplyLedgerAttempt
 } from "./reply-ledger.mjs";
+import {
+  buildInteractiveRequestId,
+  classifyInteractiveComment,
+  normalizeInteractiveDecision
+} from "./interactive-comment-protocol.mjs";
 
 /** 与平台常见限制一致：按 Unicode 码点计数字符（汉字、标点、字母、空格各计 1），超出则截断 */
 const MAX_REPLY_MESSAGE_CHARS = 400;
@@ -617,6 +622,404 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+function getNextInteractiveComment(snapshot, processedSignatures) {
+  return (
+    snapshot.find((comment) => comment?.signature && !processedSignatures.has(comment.signature)) ??
+    null
+  );
+}
+
+function buildInteractiveSummary(state, options) {
+  const results = state.results;
+  return {
+    mode: options.interactiveMode || "smart",
+    preview: Boolean(options.preview),
+    exitReason: state.exitReason || "running",
+    exitDetails: state.exitDetails,
+    elapsedMs: Date.now() - state.startedAt,
+    configuredTimeoutMs: state.timeoutMs,
+    configuredIdleMs: state.idleMs,
+    decisionLimit: state.decisionLimit,
+    decisionCount: state.decisionCount,
+    repliedCount: results.filter((item) => item.status === "replied").length,
+    sentUnconfirmedCount: results.filter((item) => item.status === "sent_unconfirmed").length,
+    previewCount: results.filter((item) => item.status === "preview_generated").length,
+    actedCount: results.filter(
+      (item) =>
+        item.status === "replied" ||
+        item.status === "sent_unconfirmed" ||
+        item.status === "preview_generated"
+    ).length,
+    skippedCount: results.filter((item) => item.status.startsWith("skipped_")).length,
+    errorCount: results.filter((item) => item.status === "error").length,
+    totalProcessed: results.length,
+    results: [...results]
+  };
+}
+
+async function persistPageReplyMarker(comment, options) {
+  const workTitle = options.selectedWork?.title || options.workTitle || "";
+  if (!workTitle) {
+    return;
+  }
+
+  try {
+    recordReplyLedgerEvent(
+      {
+        workTitle,
+        username: comment.username,
+        commentText: comment.commentText,
+        publishText: comment.publishText,
+        replyMessage: null,
+        status: "page_replied",
+        source: "interactive_page_reply_marker"
+      },
+      options
+    );
+  } catch (error) {
+    logReplyFilterDebug("failed to persist interactive page reply marker", {
+      username: comment.username,
+      commentText: comment.commentText,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function persistDecisionSkip(comment, decision, options) {
+  if (!decision.remember) {
+    return null;
+  }
+
+  const workTitle = options.selectedWork?.title || options.workTitle || "";
+  if (!workTitle) {
+    return "Missing work title; skip decision was not persisted.";
+  }
+
+  try {
+    recordReplyLedgerEvent(
+      {
+        workTitle,
+        username: comment.username,
+        commentText: comment.commentText,
+        publishText: comment.publishText,
+        replyMessage: null,
+        status: "decision_skipped",
+        source: "interactive_decision"
+      },
+      options
+    );
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * 保持浏览器会话打开，逐条发现评论并等待外部决策回调。
+ * requestDecision 可由 JSONL/stdin、HTTP、测试桩或其他模型适配器实现。
+ */
+export async function processCommentsInteractively(page, options) {
+  if (typeof options.requestDecision !== "function") {
+    throw new Error("Interactive comment flow requires requestDecision(payload).");
+  }
+
+  if (options.skipUnrepliedFilter) {
+    logReplyFilterDebug("interactive flow is scanning all comments by explicit option");
+  } else {
+    await applyUnrepliedCommentsFilter(page, options);
+  }
+  await waitForCommentsArea(page, options);
+
+  const scrollContainer = await markCommentScrollContainer(page);
+  await resetCommentScrollToTop(page, scrollContainer);
+  const timeoutMs = getEffectiveTimeout(options, options.timeoutMs || 1800000);
+  const decisionLimit = Math.max(1, Number(options.decisionLimit) || 20);
+  const idleMs = Math.max(100, Number(options.idleMs) || 5000);
+  const state = {
+    startedAt: Date.now(),
+    timeoutMs,
+    decisionLimit,
+    idleMs,
+    processedSignatures: new Set(),
+    results: [],
+    decisionCount: 0,
+    exitReason: "",
+    exitDetails: null
+  };
+  let stalledScrollAttempts = 0;
+  let bottomSearchBursts = 0;
+  let lastProgressAt = state.startedAt;
+
+  const appendResult = async (result, context = {}) => {
+    const entry = {
+      ...result,
+      requestId: context.requestId ?? result.requestId ?? null,
+      route: context.routing?.route ?? result.route ?? null,
+      routeReasons: context.routing?.reasons ?? result.routeReasons ?? []
+    };
+    state.results.push(entry);
+    lastProgressAt = Date.now();
+    stalledScrollAttempts = 0;
+    bottomSearchBursts = 0;
+
+    if (typeof options.onProgress === "function") {
+      await options.onProgress({
+        latestResult: entry,
+        summary: buildInteractiveSummary(state, options)
+      });
+    }
+    return entry;
+  };
+
+  while (Date.now() - state.startedAt < timeoutMs) {
+    if (state.decisionCount >= decisionLimit) {
+      state.exitReason = "decision_limit_reached";
+      state.exitDetails = {
+        decisionLimit,
+        decisionCount: state.decisionCount
+      };
+      break;
+    }
+
+    const snapshot = await extractCommentSnapshot(page);
+    const comment = getNextInteractiveComment(snapshot, state.processedSignatures);
+
+    if (comment) {
+      state.processedSignatures.add(comment.signature);
+      const baseResult = {
+        username: comment.username,
+        commentText: comment.commentText,
+        publishText: comment.publishText
+      };
+
+      if (comment.hasReplies) {
+        await persistPageReplyMarker(comment, options);
+        await appendResult({
+          ...baseResult,
+          status: "skipped_already_replied",
+          pageReplyEvidence: {
+            replyCount: comment.replyCount
+          }
+        });
+        continue;
+      }
+
+      const workTitle = options.selectedWork?.title || options.workTitle || "";
+      let ledgerEntry;
+      try {
+        ledgerEntry = getReplyLedgerEntry(
+          workTitle,
+          comment.username,
+          comment.commentText,
+          options
+        );
+      } catch (error) {
+        throw new Error(
+          `独立回复台账读取失败，交互回复已停止: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      if (ledgerEntry) {
+        await appendResult({
+          ...baseResult,
+          status: "skipped_reply_ledger",
+          ledgerEvidence: {
+            status: ledgerEntry.status,
+            recordedAt: ledgerEntry.recordedAt,
+            source: ledgerEntry.source
+          }
+        });
+        continue;
+      }
+
+      if (typeof options.getKnownReplyEvidence === "function") {
+        const databaseEvidence = await options.getKnownReplyEvidence(comment);
+        if (databaseEvidence?.replied) {
+          try {
+            recordReplyLedgerEvent(
+              {
+                workTitle,
+                username: comment.username,
+                commentText: comment.commentText,
+                publishText: comment.publishText,
+                replyMessage: databaseEvidence.replyMessage ?? null,
+                status: "db_replied",
+                source: "interactive_database_check"
+              },
+              options
+            );
+          } catch {
+            // 数据库证据已足够跳过；台账回写失败只影响自愈，不允许因此发送。
+          }
+          await appendResult({
+            ...baseResult,
+            status: "skipped_database_replied",
+            databaseEvidence
+          });
+          continue;
+        }
+      }
+
+      const enrichedComment =
+        typeof options.enrichComment === "function"
+          ? await options.enrichComment(comment)
+          : { ...comment };
+      const history = Array.isArray(enrichedComment.history) ? enrichedComment.history : [];
+      const routing = classifyInteractiveComment({
+        comment: enrichedComment,
+        workTitle,
+        history,
+        mode: options.interactiveMode
+      });
+      const requestId = buildInteractiveRequestId(workTitle, comment, state.decisionCount + 1);
+      state.decisionCount += 1;
+
+      const rawDecision = await options.requestDecision({
+        requestId,
+        sequence: state.decisionCount,
+        selectedWork: options.selectedWork,
+        comment: enrichedComment,
+        routing
+      });
+      const decision = normalizeInteractiveDecision(rawDecision, requestId);
+
+      if (decision.action === "stop") {
+        state.exitReason = "stopped_by_decision";
+        state.exitDetails = {
+          requestId,
+          reason: decision.reason
+        };
+        break;
+      }
+
+      if (decision.action === "skip") {
+        const persistenceError = await persistDecisionSkip(comment, decision, options);
+        await appendResult(
+          {
+            ...baseResult,
+            status: "skipped_by_decision",
+            decisionReason: decision.reason,
+            skipRemembered: decision.remember,
+            ...(persistenceError ? { persistenceError } : {})
+          },
+          { requestId, routing }
+        );
+        continue;
+      }
+
+      if (options.preview) {
+        await appendResult(
+          {
+            ...baseResult,
+            status: "preview_generated",
+            appliedReplyMessage: decision.replyMessage,
+            decisionReason: decision.reason
+          },
+          { requestId, routing }
+        );
+        continue;
+      }
+
+      const commentLocator = page
+        .locator(`[data-codex-comment-block="${comment.domIndex}"]`)
+        .first();
+      const replyResult = await safeReplyToComment(page, commentLocator, comment, {
+        ...options,
+        replyMessage: decision.replyMessage,
+        replyDryRun: false
+      });
+      const completedResult = {
+        ...replyResult,
+        requestedReplyMessage: decision.replyMessage,
+        decisionReason: decision.reason
+      };
+
+      if (typeof options.afterReplyResult === "function") {
+        await options.afterReplyResult({
+          comment,
+          decision,
+          result: completedResult
+        });
+      }
+      await appendResult(completedResult, { requestId, routing });
+      continue;
+    }
+
+    const terminalIndicator = await getCommentTerminalIndicator(page);
+    if (terminalIndicator) {
+      state.exitReason = terminalIndicator.kind;
+      state.exitDetails = { terminalIndicator };
+      break;
+    }
+
+    const previousFingerprint = await captureCommentListFingerprint(page);
+    const scrollState = await advanceCommentScroll(page, scrollContainer, {
+      distanceMultiplier: 1.25,
+      minDistancePx: 1100,
+      wheelDeltaY: 1400,
+      pageDistanceMultiplier: 1.1,
+      pageMinDistancePx: 900
+    });
+    const listChanged = await waitForCommentListChange(
+      page,
+      previousFingerprint,
+      Math.min(10000, idleMs)
+    );
+    const nextSnapshot = await extractCommentSnapshot(page);
+    const hasUnprocessed = Boolean(
+      getNextInteractiveComment(nextSnapshot, state.processedSignatures)
+    );
+    const scrollMoved = scrollState.after > scrollState.before;
+    const reachedBottom =
+      scrollState.after >= scrollState.maxScrollTop && scrollState.after === scrollState.before;
+
+    if (hasUnprocessed) {
+      stalledScrollAttempts = 0;
+      bottomSearchBursts = 0;
+      continue;
+    }
+
+    if (scrollMoved || listChanged) {
+      stalledScrollAttempts = 0;
+    } else {
+      stalledScrollAttempts += 1;
+    }
+    bottomSearchBursts = reachedBottom ? bottomSearchBursts + 1 : 0;
+
+    if (bottomSearchBursts >= 3) {
+      state.exitReason = "reached_bottom_without_new_comments";
+      state.exitDetails = { bottomSearchBursts };
+      break;
+    }
+    if (stalledScrollAttempts >= 8) {
+      state.exitReason = "stalled_scroll_attempts";
+      state.exitDetails = { stalledScrollAttempts };
+      break;
+    }
+    if (Date.now() - lastProgressAt >= idleMs * 2 && stalledScrollAttempts >= 4) {
+      state.exitReason = "idle_window_without_new_comments";
+      state.exitDetails = {
+        idleMs: idleMs * 2,
+        stalledScrollAttempts
+      };
+      break;
+    }
+  }
+
+  if (!state.exitReason) {
+    state.exitReason =
+      Date.now() - state.startedAt >= timeoutMs
+        ? "interactive_flow_total_timeout"
+        : "interactive_flow_finished";
+    state.exitDetails = {
+      timeoutMs,
+      elapsedMs: Date.now() - state.startedAt
+    };
+  }
+
+  return buildInteractiveSummary(state, options);
 }
 
 async function aggressivelyAdvanceCommentScroll(

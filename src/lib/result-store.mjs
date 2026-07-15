@@ -227,6 +227,24 @@ export function prepareResultForOutput(result) {
         (item) => item?.status === "replied"
       ).length;
     }
+    if (typeof nextResult.sentUnconfirmedCount === "number") {
+      nextResult.sentUnconfirmedCount = dedupedResults.entries.filter(
+        (item) => item?.status === "sent_unconfirmed"
+      ).length;
+    }
+    if (typeof nextResult.previewCount === "number") {
+      nextResult.previewCount = dedupedResults.entries.filter(
+        (item) => item?.status === "preview_generated"
+      ).length;
+    }
+    if (typeof nextResult.actedCount === "number") {
+      nextResult.actedCount = dedupedResults.entries.filter(
+        (item) =>
+          item?.status === "replied" ||
+          item?.status === "sent_unconfirmed" ||
+          item?.status === "preview_generated"
+      ).length;
+    }
     if (typeof nextResult.dryRunCount === "number") {
       nextResult.dryRunCount = dedupedResults.entries.filter(
         (item) => item?.status === "dry_run_typed"
