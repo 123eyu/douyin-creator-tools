@@ -244,7 +244,23 @@ export async function getCommentTerminalIndicator(page) {
 }
 
 export async function applyUnrepliedCommentsFilter(page, options) {
-  const filterTrigger = await waitForCommentStatusFilter(page, options);
+  let filterTrigger;
+  try {
+    const filterProbeTimeoutMs = Math.min(
+      getEffectiveTimeout(options, options.uiTimeoutMs),
+      options.filterProbeTimeoutMs ?? 5000
+    );
+    filterTrigger = await waitForCommentStatusFilter(page, {
+      ...options,
+      uiTimeoutMs: filterProbeTimeoutMs
+    });
+  } catch (err) {
+    if (err.message && err.message.includes("Timed out waiting for the comment status filter")) {
+      console.log("[comment] 未找到评论状态过滤下拉框（旧作品），跳过过滤，直接在全部评论中查找");
+      return { applied: false, reason: "filter_not_found" };
+    }
+    throw err;
+  }
 
   try {
     await filterTrigger.scrollIntoViewIfNeeded().catch(() => {});
@@ -273,7 +289,7 @@ export async function applyUnrepliedCommentsFilter(page, options) {
       optionTexts.push(normalizeText(await optionsLocator.nth(index).textContent()));
     }
     logReplyFilterDebug("comment filter dropdown options", optionTexts);
-    const refreshTimeoutMs = Math.min(getEffectiveTimeout(options, options.uiTimeoutMs), 8000);
+    const refreshTimeoutMs = Math.min(getEffectiveTimeout(options, options.uiTimeoutMs), 30000);
 
     for (let index = 0; index < optionCount; index += 1) {
       const option = optionsLocator.nth(index);
@@ -574,6 +590,24 @@ export async function advanceCommentScroll(page, scrollContainer, options = {}) 
 
 export async function collectComments(page, options) {
   const filterMode = options.filterMode ?? "unreplied";
+  const pageRepliedSignatures = new Set();
+  const keepEligibleComments = (snapshot) => {
+    if (filterMode === "all") {
+      return snapshot;
+    }
+
+    return snapshot.filter((comment) => {
+      if (!comment.hasReplies) {
+        return true;
+      }
+
+      if (comment.signature) {
+        pageRepliedSignatures.add(comment.signature);
+      }
+      return false;
+    });
+  };
+
   if (filterMode === "all") {
     logReplyFilterDebug(
       "entering all-comments collection flow, filter already applied via page reload"
@@ -610,7 +644,7 @@ export async function collectComments(page, options) {
   let stalledScrollAttempts = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
-    const snapshot = await extractCommentSnapshot(page);
+    const snapshot = keepEligibleComments(await extractCommentSnapshot(page));
     const additions = addCommentsFromSnapshot(commentsBySignature, snapshot);
     if (additions > 0) {
       lastProgressAt = Date.now();
@@ -631,7 +665,7 @@ export async function collectComments(page, options) {
 
     await waitForCommentListChange(page, previousFingerprint, 2500);
 
-    const postScrollSnapshot = await extractCommentSnapshot(page);
+    const postScrollSnapshot = keepEligibleComments(await extractCommentSnapshot(page));
     const postScrollAdditions = addCommentsFromSnapshot(commentsBySignature, postScrollSnapshot);
     if (postScrollAdditions > 0) {
       lastProgressAt = Date.now();
@@ -665,6 +699,10 @@ export async function collectComments(page, options) {
     if (idleElapsedMs >= options.idleMs && stalledScrollAttempts >= 2) {
       break;
     }
+  }
+
+  if (pageRepliedSignatures.size > 0) {
+    console.log(`[comment] 根据页面回复标记过滤掉 ${pageRepliedSignatures.size} 条已有回复的评论`);
   }
 
   return [...commentsBySignature.values()]

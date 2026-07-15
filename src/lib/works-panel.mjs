@@ -7,18 +7,28 @@ import {
   waitForAsyncCondition
 } from "./common.mjs";
 
+const MAX_WORKS_SCAN_ATTEMPTS = 3;
+const MAX_IDLE_RECOVERIES_PER_SCAN = 3;
+
 async function openWorksSideSheet(page, options) {
-  const sideSheet = page.locator(".douyin-creator-interactive-sidesheet-body").first();
+  const visibleSideSheet = () =>
+    page.locator(".douyin-creator-interactive-sidesheet-body:visible").last();
+  let sideSheet = visibleSideSheet();
 
   if (await sideSheet.isVisible().catch(() => false)) {
     return sideSheet;
   }
 
   const trigger = page
-    .locator('button:has-text("选择作品"), [role="button"]:has-text("选择作品")')
-    .first();
+    .locator('button:has-text("选择作品"):visible, [role="button"]:has-text("选择作品"):visible')
+    .last();
 
+  await trigger.waitFor({
+    state: "visible",
+    timeout: getEffectiveTimeout(options, options.uiTimeoutMs)
+  });
   await trigger.click();
+  sideSheet = visibleSideSheet();
   await sideSheet.waitFor({
     state: "visible",
     timeout: getEffectiveTimeout(options, options.uiTimeoutMs)
@@ -123,11 +133,37 @@ function getWorksFingerprint(works) {
   return works.map((work) => `${work.title}|${work.publishText}`).join("\n");
 }
 
-function summarizeWorksPreview(works, limit = 4) {
-  return works.slice(0, limit).map((work) => ({
-    title: work.title,
-    publishText: work.publishText
-  }));
+function mergeWorks(targetMap, works) {
+  let addedCount = 0;
+  for (const work of works) {
+    const signature = `${work.title}|${work.publishText}`;
+    if (targetMap.has(signature)) {
+      continue;
+    }
+    targetMap.set(signature, work);
+    addedCount += 1;
+  }
+  return addedCount;
+}
+
+async function retriggerWorksLazyLoad(page, sideSheet) {
+  const state = await sideSheet.evaluate((element) => {
+    const before = element.scrollTop;
+    const distance = Math.max(element.clientHeight * 0.45, 360);
+    element.scrollTop = Math.max(0, before - distance);
+    return {
+      before,
+      afterNudgeUp: element.scrollTop,
+      maxScrollTop: Math.max(element.scrollHeight - element.clientHeight, 0)
+    };
+  });
+
+  await page.waitForTimeout(350);
+  await sideSheet.evaluate((element) => {
+    element.scrollTop = Math.max(element.scrollHeight - element.clientHeight, 0);
+  });
+  await page.waitForTimeout(650);
+  return state;
 }
 
 function countPartialTitleMatches(works, workTitle) {
@@ -308,27 +344,36 @@ async function fetchAllWorks(page, options) {
   const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
-  let previousDomCount = -1;
-  let previousFingerprint = "";
   let latestDomWorks = [];
+  let idleRecoveryCount = 0;
+  const allWorks = new Map();
 
   while (Date.now() - startedAt < timeoutMs) {
     latestDomWorks = await extractWorksFromSideSheet(sideSheet);
     const domCount = latestDomWorks.length;
     const fingerprint = getWorksFingerprint(latestDomWorks);
     const hasSignal = domCount > 0;
-    const changed = domCount !== previousDomCount || fingerprint !== previousFingerprint;
+    const addedCount = mergeWorks(allWorks, latestDomWorks);
 
-    if (changed) {
+    if (addedCount > 0) {
       lastProgressAt = Date.now();
+      idleRecoveryCount = 0;
     }
 
     if (hasSignal && Date.now() - lastProgressAt >= options.idleMs) {
-      break;
+      if (idleRecoveryCount >= MAX_IDLE_RECOVERIES_PER_SCAN) {
+        break;
+      }
+      idleRecoveryCount += 1;
+      logReplyFilterDebug("works list idle; retriggering lazy load", {
+        idleRecoveryCount,
+        visibleCount: domCount,
+        accumulatedCount: allWorks.size
+      });
+      await retriggerWorksLazyLoad(page, sideSheet);
+      lastProgressAt = Date.now();
+      continue;
     }
-
-    previousDomCount = domCount;
-    previousFingerprint = fingerprint;
 
     await sideSheet.evaluate((element, hasSignalNow) => {
       if (!hasSignalNow) {
@@ -349,8 +394,8 @@ async function fetchAllWorks(page, options) {
     );
   }
 
-  const domFallbackWorks =
-    latestDomWorks.length > 0 ? latestDomWorks : await extractWorksFromSideSheet(sideSheet);
+  mergeWorks(allWorks, await extractWorksFromSideSheet(sideSheet));
+  const domFallbackWorks = Array.from(allWorks.values());
   if (domFallbackWorks.length > 0) {
     return domFallbackWorks;
   }
@@ -414,6 +459,27 @@ function findVisibleTargetWork(works, workTitle, workPublishText = "") {
     };
   }
 
+  if (partialTitleMatches.length > 1 && workPublishText) {
+    const normalizedPublishText = normalizeLookupText(workPublishText);
+    const publishMatchedWork =
+      partialTitleMatches.find((work) => {
+        const publishText = normalizeLookupText(work.publishText);
+        return (
+          publishText === normalizedPublishText ||
+          publishText.includes(normalizedPublishText) ||
+          normalizedPublishText.includes(publishText)
+        );
+      }) ?? null;
+
+    if (publishMatchedWork) {
+      return {
+        matchedWork: publishMatchedWork,
+        matchMode: "partial_publish_text",
+        partialTitleMatchCount: partialTitleMatches.length
+      };
+    }
+  }
+
   return {
     matchedWork: null,
     matchMode: "",
@@ -450,16 +516,30 @@ export function getSelectedWorkOutput(work) {
 }
 
 export async function fetchAllWorksWithRetry(page, options) {
-  try {
-    return await fetchAllWorks(page, options);
-  } catch (error) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_WORKS_SCAN_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchAllWorks(page, options);
+    } catch (error) {
+      lastError = error;
+      logReplyFilterDebug("works list scan failed, reopening side sheet for retry", {
+        attempt,
+        maxAttempts: MAX_WORKS_SCAN_ATTEMPTS,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    if (attempt >= MAX_WORKS_SCAN_ATTEMPTS) {
+      break;
+    }
     const sideSheet = await openWorksSideSheet(page, options);
     await sideSheet.evaluate((element) => {
       element.scrollTop = 0;
     });
-    await page.waitForTimeout(200);
-    return fetchAllWorks(page, options);
+    await page.waitForTimeout(600 * attempt);
   }
+
+  throw lastError;
 }
 
 async function findTargetWork(page, options) {
@@ -467,9 +547,9 @@ async function findTargetWork(page, options) {
   const timeoutMs = getEffectiveTimeout(options, options.timeoutMs);
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
-  let previousDomCount = -1;
-  let previousFingerprint = "";
   let latestDomWorks = [];
+  let idleRecoveryCount = 0;
+  const allWorks = new Map();
 
   logReplyFilterDebug("work target scan started", {
     workTitle: options.workTitle,
@@ -481,10 +561,11 @@ async function findTargetWork(page, options) {
     const domCount = latestDomWorks.length;
     const fingerprint = getWorksFingerprint(latestDomWorks);
     const hasSignal = domCount > 0;
-    const changed = domCount !== previousDomCount || fingerprint !== previousFingerprint;
+    const addedCount = mergeWorks(allWorks, latestDomWorks);
 
-    if (changed) {
+    if (addedCount > 0) {
       lastProgressAt = Date.now();
+      idleRecoveryCount = 0;
     }
 
     const visibleTargetMatch = findVisibleTargetWork(
@@ -517,14 +598,31 @@ async function findTargetWork(page, options) {
       return targetWork;
     }
 
-    previousDomCount = domCount;
-    previousFingerprint = fingerprint;
-
     if (hasSignal && Date.now() - lastProgressAt >= options.idleMs) {
+      if (idleRecoveryCount < MAX_IDLE_RECOVERIES_PER_SCAN) {
+        idleRecoveryCount += 1;
+        logReplyFilterDebug("work target scan idle; retriggering lazy load", {
+          elapsedMs: Date.now() - startedAt,
+          idleRecoveryCount,
+          visibleCount: domCount,
+          accumulatedCount: allWorks.size,
+          partialTitleMatchCount: countPartialTitleMatches(
+            Array.from(allWorks.values()),
+            options.workTitle
+          )
+        });
+        await retriggerWorksLazyLoad(page, sideSheet);
+        lastProgressAt = Date.now();
+        continue;
+      }
       logReplyFilterDebug("work target scan stopped at idle window", {
         elapsedMs: Date.now() - startedAt,
         domCount,
-        partialTitleMatchCount: countPartialTitleMatches(latestDomWorks, options.workTitle)
+        accumulatedCount: allWorks.size,
+        partialTitleMatchCount: countPartialTitleMatches(
+          Array.from(allWorks.values()),
+          options.workTitle
+        )
       });
       break;
     }
@@ -548,11 +646,23 @@ async function findTargetWork(page, options) {
     );
   }
 
-  const fallbackTargetWork = pickTargetWork(
-    latestDomWorks,
-    options.workTitle,
-    options.workPublishText
-  );
+  mergeWorks(allWorks, await extractWorksFromSideSheet(sideSheet));
+  const accumulatedWorks = Array.from(allWorks.values());
+  let fallbackTargetWork;
+  try {
+    fallbackTargetWork = pickTargetWork(
+      accumulatedWorks,
+      options.workTitle,
+      options.workPublishText
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("No work matched title:")) {
+      throw new Error(
+        `作品列表已扫描到 ${accumulatedWorks.length} 条，但目标作品未加载出来；跨境网络或抖音接口可能只返回了部分列表。目标：${options.workTitle}`
+      );
+    }
+    throw error;
+  }
 
   if (options.selectWhenMatched) {
     const selectedInline = await selectTargetWorkFromCurrentScan(
@@ -571,16 +681,31 @@ async function findTargetWork(page, options) {
 }
 
 export async function findTargetWorkWithRetry(page, options) {
-  try {
-    return await findTargetWork(page, options);
-  } catch (error) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_WORKS_SCAN_ATTEMPTS; attempt += 1) {
+    try {
+      return await findTargetWork(page, options);
+    } catch (error) {
+      lastError = error;
+      logReplyFilterDebug("target work scan failed, reopening side sheet for retry", {
+        attempt,
+        maxAttempts: MAX_WORKS_SCAN_ATTEMPTS,
+        workTitle: options.workTitle,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    if (attempt >= MAX_WORKS_SCAN_ATTEMPTS) {
+      break;
+    }
     const sideSheet = await openWorksSideSheet(page, options);
     await sideSheet.evaluate((element) => {
       element.scrollTop = 0;
     });
-    await page.waitForTimeout(200);
-    return findTargetWork(page, options);
+    await page.waitForTimeout(600 * attempt);
   }
+
+  throw lastError;
 }
 
 function pickTargetWork(works, workTitle, workPublishText = "") {
@@ -626,6 +751,22 @@ function pickTargetWork(works, workTitle, workPublishText = "") {
 
   if (partialMatches.length === 1) {
     return partialMatches[0];
+  }
+
+  if (partialMatches.length > 1 && workPublishText) {
+    const normalizedPublishText = normalizeLookupText(workPublishText);
+    const publishMatched = partialMatches.filter((work) => {
+      const publishText = normalizeLookupText(work.publishText);
+      return (
+        publishText === normalizedPublishText ||
+        publishText.includes(normalizedPublishText) ||
+        normalizedPublishText.includes(publishText)
+      );
+    });
+
+    if (publishMatched.length === 1) {
+      return publishMatched[0];
+    }
   }
 
   if (partialMatches.length > 1) {

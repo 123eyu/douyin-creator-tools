@@ -149,7 +149,8 @@ export async function loadReplyCommentsFile(replyCommentsFile) {
     selectedWork: normalizeSelectedWorkHint(parsed.selectedWork),
     plans,
     totalCount: normalizedEntries.length,
-    actionableCount: plans.length
+    actionableCount: plans.length,
+    skipUnrepliedFilter: Boolean(parsed.skipUnrepliedFilter)
   };
 }
 

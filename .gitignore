@@ -1,6 +1,10 @@
 node_modules/
 .playwright/
 comments-output/
+browser-data/
+comment-images/
+default/
+~/
 .history/
 .vscode/
 data/

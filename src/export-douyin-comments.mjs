@@ -27,6 +27,7 @@ function parseArgs(argv) {
   const args = {
     ...createSharedCliArgs(),
     workTitle: "",
+    workPublishText: "",
     limit: 200,
     noHistory: false,
     outputPath: DEFAULT_EXPORT_OUTPUT_PATH
@@ -51,6 +52,10 @@ function parseArgs(argv) {
         break;
       case "--out":
         args.outputPath = argv[index + 1] ?? DEFAULT_EXPORT_OUTPUT_PATH;
+        index += 1;
+        break;
+      case "--work-publish-text":
+        args.workPublishText = normalizeText(argv[index + 1] ?? "");
         index += 1;
         break;
       case "--no-history":

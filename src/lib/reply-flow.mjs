@@ -16,6 +16,11 @@ import {
   waitForCommentsArea
 } from "./comment-ops.mjs";
 import { extractCommentSnapshot } from "./comment-snapshot.mjs";
+import {
+  getReplyLedgerEntry,
+  recordReplyLedgerEvent,
+  reserveReplyLedgerAttempt
+} from "./reply-ledger.mjs";
 
 /** 与平台常见限制一致：按 Unicode 码点计数字符（汉字、标点、字母、空格各计 1），超出则截断 */
 const MAX_REPLY_MESSAGE_CHARS = 400;
@@ -96,7 +101,6 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds, visibleUsernameCo
     commentUsername
   );
   const visibleCommentCount = visibleUsernameCounts.get(commentUsername) || 0;
-  const requireCommentMatch = remainingPlanCount > 1 || visibleCommentCount > 1;
 
   for (const plan of replyPlans) {
     if (processedPlanIds.has(plan.id)) {
@@ -111,6 +115,7 @@ function matchReplyPlan(comment, replyPlans, processedPlanIds, visibleUsernameCo
       continue;
     }
 
+    const requireCommentMatch = Boolean(normalizeText(plan.commentText));
     if (requireCommentMatch && !commentTextsMatch(plan.commentText, comment.commentText)) {
       continue;
     }
@@ -176,9 +181,12 @@ async function inspectCommentActions(commentLocator) {
     const candidates = Array.from(root.querySelectorAll("button, div, span"));
     const toggleCandidate = candidates.find((node) => {
       const text = normalize(node.textContent || "");
-      return (text.includes("条回复") || text === "收起") && text.length <= 20;
+      return text === "收起" || /^(?:查看|展开)?(?:全部)?\d+条回复$/.test(text);
     });
     const replyCandidate = candidates.find((node) => normalize(node.textContent || "") === "回复");
+    const toggleText = normalize(toggleCandidate?.textContent || "");
+    const replyCountMatch = toggleText.match(/(\d+)条回复/);
+    const replyCount = replyCountMatch ? Number(replyCountMatch[1]) : null;
     const editableValues = Array.from(root.querySelectorAll('[contenteditable="true"]'))
       .map((node) => normalize(node.textContent || ""))
       .filter(Boolean)
@@ -195,7 +203,12 @@ async function inspectCommentActions(commentLocator) {
 
     return {
       hasToggle: toggleCandidate instanceof HTMLElement,
-      toggleText: normalize(toggleCandidate?.textContent || ""),
+      toggleText,
+      // “收起”说明线程已展开；无法解析非空回复标记时保守跳过，避免重复回复。
+      hasExistingReplies:
+        toggleCandidate instanceof HTMLElement &&
+        (toggleText === "收起" || replyCount === null || replyCount > 0),
+      replyCount,
       hasReplyButton: replyCandidate instanceof HTMLElement,
       openInputCount: root.querySelectorAll('[contenteditable="true"]').length,
       editableValues,
@@ -239,8 +252,70 @@ async function waitForReplySendReady(page, commentLocator, timeoutMs, options = 
   throw new Error(`Timed out waiting for the send button after ${effectiveTimeoutMs}ms.`);
 }
 
-function isResolvedReplyStatus(status) {
-  return status === "replied" || status === "dry_run_typed";
+async function waitForReplyConfirmation(page, commentLocator, timeoutMs, options = null) {
+  const effectiveTimeoutMs = getEffectiveTimeout(options, timeoutMs);
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < effectiveTimeoutMs) {
+    const commentStillVisible = (await commentLocator.count().catch(() => 0)) > 0;
+    if (!commentStillVisible) {
+      return {
+        confirmedBy: "comment_removed_from_current_filter"
+      };
+    }
+
+    const actionState = await inspectCommentActions(commentLocator).catch(() => null);
+    if (actionState?.hasExistingReplies) {
+      return {
+        confirmedBy: "reply_thread_visible",
+        toggleText: actionState.toggleText,
+        replyCount: actionState.replyCount
+      };
+    }
+
+    const successToast = await page.evaluate(() => {
+      const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+      return Array.from(document.querySelectorAll('[role="alert"], div, span'))
+        .filter((node) => node instanceof HTMLElement)
+        .find((node) => {
+          const text = normalize(node.textContent || "");
+          if (text !== "回复成功" && text !== "发送成功") {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden"
+          );
+        })?.textContent;
+    });
+    if (successToast) {
+      return {
+        confirmedBy: "success_toast",
+        message: successToast.replace(/\s+/g, " ").trim()
+      };
+    }
+
+    await page.waitForTimeout(150);
+  }
+
+  return null;
+}
+
+function isResolvedPlanStatus(status) {
+  return (
+    status === "replied" ||
+    status === "sent_unconfirmed" ||
+    status === "dry_run_typed" ||
+    status.startsWith("skipped_")
+  );
+}
+
+function isReplyActionStatus(status) {
+  return status === "replied" || status === "sent_unconfirmed" || status === "dry_run_typed";
 }
 
 async function safeReplyToComment(page, commentLocator, comment, options) {
@@ -263,6 +338,18 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     replyMessageTruncated
   };
   let stage = "start";
+  let sendClicked = false;
+  let sendAttemptRecorded = false;
+  const workTitle = options.selectedWork?.title || options.workTitle || "";
+  const ledgerEvent = (status, source = "reply_flow") => ({
+    workTitle,
+    username: comment.username,
+    commentText: comment.commentText,
+    publishText: comment.publishText,
+    replyMessage: replyText,
+    status,
+    source
+  });
 
   try {
     logReplyFilterDebug("processing reply target", {
@@ -271,30 +358,92 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
       publishText: comment.publishText
     });
 
-    let actionState = await inspectCommentActions(commentLocator);
+    if (workTitle) {
+      let ledgerEntry;
+      try {
+        ledgerEntry = getReplyLedgerEntry(
+          workTitle,
+          comment.username,
+          comment.commentText,
+          options
+        );
+      } catch (error) {
+        logReplyFilterDebug("reply ledger could not be read; skipping send fail-closed", {
+          username: comment.username,
+          commentText: comment.commentText,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return {
+          ...result,
+          status: "skipped_reply_ledger_unavailable",
+          appliedReplyMessage: "",
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+
+      if (ledgerEntry) {
+        logReplyFilterDebug("skipping comment found in durable reply ledger", {
+          username: comment.username,
+          commentText: comment.commentText,
+          ledgerStatus: ledgerEntry.status,
+          ledgerRecordedAt: ledgerEntry.recordedAt
+        });
+        return {
+          ...result,
+          status: "skipped_reply_ledger",
+          appliedReplyMessage: "",
+          ledgerEvidence: {
+            status: ledgerEntry.status,
+            recordedAt: ledgerEntry.recordedAt,
+            source: ledgerEntry.source
+          }
+        };
+      }
+    }
+
+    const actionState = await inspectCommentActions(commentLocator);
     logReplyFilterDebug("initial comment action state", {
       username: comment.username,
       commentText: comment.commentText,
       actionState
     });
 
-    if (actionState.hasToggle && actionState.toggleText.includes("条回复")) {
-      stage = "expand_replies";
-      const toggleButton = commentLocator.locator('[data-codex-toggle-action="true"]').first();
-      await toggleButton.click();
-      await page.waitForTimeout(Math.min(1000, options.replySettleMs));
-      actionState = await inspectCommentActions(commentLocator);
-      logReplyFilterDebug("action state after expanding replies", {
+    if (actionState.hasExistingReplies) {
+      logReplyFilterDebug("skipping comment because page shows existing replies", {
         username: comment.username,
         commentText: comment.commentText,
-        actionState
+        toggleText: actionState.toggleText,
+        replyCount: actionState.replyCount
       });
+
+      if (workTitle) {
+        try {
+          recordReplyLedgerEvent(ledgerEvent("page_replied", "page_reply_marker"), options);
+        } catch (error) {
+          logReplyFilterDebug("failed to heal reply ledger from page marker", {
+            username: comment.username,
+            commentText: comment.commentText,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      return {
+        ...result,
+        status: "skipped_already_replied",
+        appliedReplyMessage: "",
+        pageReplyEvidence: {
+          toggleText: actionState.toggleText,
+          replyCount: actionState.replyCount
+        }
+      };
     }
 
     if (!actionState.hasReplyButton) {
       return {
         ...result,
-        status: "skipped_no_reply_button"
+        status: "skipped_no_reply_button",
+        appliedReplyMessage: ""
       };
     }
 
@@ -332,23 +481,129 @@ async function safeReplyToComment(page, commentLocator, comment, options) {
     await waitForReplySendReady(page, commentLocator, options.replyTimeoutMs, options);
 
     const sendButton = commentLocator.getByText("发送", { exact: true }).first();
+    if (workTitle) {
+      stage = "record_send_attempt";
+      const reservation = reserveReplyLedgerAttempt(ledgerEvent("send_attempted"), options);
+      if (!reservation.reserved) {
+        await inputBox.evaluate((element) => {
+          element.textContent = "";
+          const inputEvent = element.ownerDocument.createEvent("Event");
+          inputEvent.initEvent("input", true, false);
+          element.dispatchEvent(inputEvent);
+        });
+        return {
+          ...result,
+          status:
+            reservation.reason === "existing_entry"
+              ? "skipped_reply_ledger"
+              : "skipped_reply_ledger_busy",
+          appliedReplyMessage: "",
+          ledgerEvidence: reservation.existingEntry
+            ? {
+                status: reservation.existingEntry.status,
+                recordedAt: reservation.existingEntry.recordedAt,
+                source: reservation.existingEntry.source
+              }
+            : undefined
+        };
+      }
+      sendAttemptRecorded = true;
+    }
     stage = "click_send_button";
     await sendButton.click();
-    await page.waitForTimeout(1000);
+    sendClicked = true;
     logReplyFilterDebug("clicked send button", {
       username: comment.username,
       commentText: comment.commentText
     });
 
-    logReplyFilterDebug("reply treated as successful immediately after clicking send", {
+    stage = "confirm_reply";
+    const replyConfirmation = await waitForReplyConfirmation(
+      page,
+      commentLocator,
+      options.replyTimeoutMs,
+      options
+    );
+    if (!replyConfirmation) {
+      logReplyFilterDebug("send was clicked but page confirmation was not observed", {
+        username: comment.username,
+        commentText: comment.commentText
+      });
+      if (workTitle) {
+        try {
+          recordReplyLedgerEvent(ledgerEvent("sent_unconfirmed"), options);
+        } catch (error) {
+          logReplyFilterDebug("failed to append unconfirmed send to reply ledger", {
+            username: comment.username,
+            commentText: comment.commentText,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      return {
+        ...result,
+        status: "sent_unconfirmed",
+        errorStage: stage,
+        error:
+          "发送已点击，但页面未在超时时间内显示回复成功证据；为避免重复回复，本计划不会自动重试。"
+      };
+    }
+
+    logReplyFilterDebug("reply confirmed by page", {
       username: comment.username,
-      commentText: comment.commentText
+      commentText: comment.commentText,
+      replyConfirmation
     });
+    if (workTitle) {
+      try {
+        recordReplyLedgerEvent(ledgerEvent("replied"), options);
+      } catch (error) {
+        // send_attempted 已经持久化，即使最终状态追加失败，后续也会保守跳过。
+        logReplyFilterDebug("failed to append confirmed status to reply ledger", {
+          username: comment.username,
+          commentText: comment.commentText,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
     return {
       ...result,
-      status: "replied"
+      status: "replied",
+      replyConfirmation
     };
   } catch (error) {
+    if (sendClicked) {
+      logReplyFilterDebug("send was clicked but confirmation check failed", {
+        username: comment.username,
+        commentText: comment.commentText,
+        stage,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return {
+        ...result,
+        status: "sent_unconfirmed",
+        errorStage: stage,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+
+    if (sendAttemptRecorded || stage === "record_send_attempt") {
+      logReplyFilterDebug("send stopped after durable attempt record; automatic retry disabled", {
+        username: comment.username,
+        commentText: comment.commentText,
+        stage,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return {
+        ...result,
+        status: "skipped_send_attempt_recorded",
+        appliedReplyMessage: "",
+        errorStage: stage,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+
     logReplyFilterDebug("reply failed", {
       username: comment.username,
       commentText: comment.commentText,
@@ -430,7 +685,11 @@ async function aggressivelyAdvanceCommentScroll(
 }
 
 export async function replyToComments(page, options) {
-  await applyUnrepliedCommentsFilter(page, options);
+  if (options.skipUnrepliedFilter) {
+    logReplyFilterDebug("skipping unreplied filter by explicit plan option");
+  } else {
+    await applyUnrepliedCommentsFilter(page, options);
+  }
   await waitForCommentsArea(page, options);
 
   const scrollContainer = await markCommentScrollContainer(page);
@@ -494,16 +753,19 @@ export async function replyToComments(page, options) {
         replyPlanId: plan?.id ?? null,
         requestedReplyMessage: replyMessage
       });
-      if (isResolvedReplyStatus(replyResult.status)) {
+      if (isResolvedPlanStatus(replyResult.status)) {
         processedSignatures.add(nextComment.signature);
         if (plan) {
           processedPlanIds.add(plan.id);
         }
-        actedCount += 1;
         lastProgressAt = Date.now();
         loggedNoMatchSnapshot = false;
         stalledScrollAttempts = 0;
         bottomSearchBursts = 0;
+      }
+
+      if (isReplyActionStatus(replyResult.status)) {
+        actedCount += 1;
       }
 
       if (replyResult.status === "replied") {
@@ -525,7 +787,7 @@ export async function replyToComments(page, options) {
         break;
       }
 
-      if (!isResolvedReplyStatus(replyResult.status)) {
+      if (!isResolvedPlanStatus(replyResult.status)) {
         await page.waitForTimeout(600);
       }
 
@@ -684,6 +946,13 @@ export async function replyToComments(page, options) {
   }
 
   const skippedCount = results.filter((item) => item.status.startsWith("skipped_")).length;
+  const skippedAlreadyRepliedCount = results.filter(
+    (item) => item.status === "skipped_already_replied"
+  ).length;
+  const skippedByLedgerCount = results.filter(
+    (item) => item.status === "skipped_reply_ledger" || item.status === "skipped_reply_ledger_busy"
+  ).length;
+  const sentUnconfirmedCount = results.filter((item) => item.status === "sent_unconfirmed").length;
   const dryRunCount = results.filter((item) => item.status === "dry_run_typed").length;
   const errorCount = results.filter((item) => item.status === "error").length;
   const unmatchedPlans = Array.isArray(options.replyPlans)
@@ -723,6 +992,9 @@ export async function replyToComments(page, options) {
     actedCount,
     dryRunCount,
     skippedCount,
+    skippedAlreadyRepliedCount,
+    skippedByLedgerCount,
+    sentUnconfirmedCount,
     errorCount,
     totalProcessed: results.length,
     matchedPlanCount: processedPlanIds.size,

@@ -42,6 +42,14 @@ git clone https://github.com/wenyg/douyin-creator-tools.git
 
 `npm run` 的参数一定放在 `--` 之后，否则被 npm 吞掉。
 
+### 回复去重保护
+
+回复流程会同时检查数据库、独立追加式台账和网页上的回复标记。独立台账位于
+`comments-output/reply-ledger.jsonl`（可用环境变量 `REPLY_LEDGER_PATH` 改路径）；发送前会先同步落盘，
+即使 SQLite 数据库丢失、抖音网页又没有显示旧回复，也会保守跳过，避免自动重复发送。
+
+请把这个台账和 `data/douyin-creator.db` 一起纳入备份，不要在回复任务之间删除它。
+
 ## 硬约束
 
 - 不绕过登录、验证码、平台风控

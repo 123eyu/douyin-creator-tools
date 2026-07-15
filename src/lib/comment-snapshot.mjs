@@ -8,7 +8,6 @@ export async function extractCommentSnapshot(page) {
     const replyThreadPattern = /(条回复|收起)/;
     const controlPattern = /^(回复|发送|收起)$/;
     const pureNumberPattern = /^\d+$/;
-    const avatarSelector = 'img, [class*="avatar"], [class*="Avatar"]';
     const xBandTolerance = 12;
     const replyIndentMinDelta = 16;
 
@@ -48,6 +47,28 @@ export async function extractCommentSnapshot(page) {
       return imgs
         .map((img) => (img.getAttribute("src") || "").trim())
         .filter((src) => src.length > 0 && src.startsWith("http"));
+    };
+
+    const extractReplyThreadState = (container) => {
+      if (!(container instanceof HTMLElement)) {
+        return { hasReplies: false, replyCount: 0 };
+      }
+
+      const replyThreadText = Array.from(container.querySelectorAll("button, div, span"))
+        .map((node) => normalize(node.textContent || ""))
+        .find((text) => text === "收起" || /^(?:查看|展开)?(?:全部)?\d+条回复$/.test(text));
+
+      if (!replyThreadText) {
+        return { hasReplies: false, replyCount: 0 };
+      }
+
+      const countMatch = replyThreadText.match(/(\d+)条回复/);
+      const replyCount = countMatch ? Number(countMatch[1]) : null;
+      return {
+        // “收起”表示回复线程已经展开；无法解析数量时也采取保守策略，避免重复回复。
+        hasReplies: replyThreadText === "收起" || replyCount === null || replyCount > 0,
+        replyCount
+      };
     };
 
     const parseStructuredEntry = (rawLines, order) => {
@@ -135,13 +156,15 @@ export async function extractCommentSnapshot(page) {
 
         if (username && commentText) {
           const imageUrls = extractImageUrls(block);
+          const replyThreadState = extractReplyThreadState(block);
           const entry = {
             username,
             commentText,
             publishText,
             consumedLineCount: 0,
             order,
-            signature: [username, commentText, publishText].map(normalize).join("|")
+            signature: [username, commentText, publishText].map(normalize).join("|"),
+            ...replyThreadState
           };
           if (imageUrls.length > 0) entry.imageUrls = imageUrls;
           return { entry };
@@ -214,13 +237,15 @@ export async function extractCommentSnapshot(page) {
       }
 
       const imageUrls = extractImageUrls(block);
+      const replyThreadState = extractReplyThreadState(block);
       const entry = {
         username,
         commentText,
         publishText,
         consumedLineCount: 0,
         order,
-        signature: [username, commentText, publishText].map(normalize).join("|")
+        signature: [username, commentText, publishText].map(normalize).join("|"),
+        ...replyThreadState
       };
       if (imageUrls.length > 0) entry.imageUrls = imageUrls;
       return { entry };
@@ -329,13 +354,15 @@ export async function extractCommentSnapshot(page) {
         }
 
         const imageUrls = extractImageUrls(container);
+        const replyThreadState = extractReplyThreadState(container);
         const entry = {
           username,
           commentText,
           publishText,
           consumedLineCount: 0,
           order: i,
-          signature
+          signature,
+          ...replyThreadState
         };
         if (imageUrls.length > 0) entry.imageUrls = imageUrls;
 
@@ -455,6 +482,8 @@ export async function extractCommentSnapshot(page) {
         commentText: currentMainComment.commentText,
         publishText: currentMainComment.publishText,
         signature: currentMainComment.signature,
+        hasReplies: Boolean(currentMainComment.hasReplies),
+        replyCount: currentMainComment.replyCount,
         order: currentMainComment.order
       };
       if (currentMainComment.imageUrls?.length > 0) {
@@ -482,6 +511,8 @@ export async function extractCommentSnapshot(page) {
           commentText: entry.commentText,
           publishText: entry.publishText,
           signature: entry.signature,
+          hasReplies: Boolean(entry.hasReplies),
+          replyCount: entry.replyCount,
           imageUrls: entry.imageUrls,
           order: block.domIndex
         };
@@ -517,6 +548,8 @@ export function addCommentsFromSnapshot(commentsBySignature, snapshot) {
     commentsBySignature.set(comment.signature, {
       ...existingComment,
       ...comment,
+      hasReplies: Boolean(existingComment.hasReplies || comment.hasReplies),
+      replyCount: Math.max(existingComment.replyCount ?? 0, comment.replyCount ?? 0),
       publishText:
         comment.publishText &&
         comment.publishText.length >= (existingComment.publishText ?? "").length

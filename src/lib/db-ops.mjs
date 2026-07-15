@@ -76,6 +76,24 @@ export function getReplyCountMap(workTitle, comments) {
 }
 
 /**
+ * 读取所有明确成功回复过的评论，用于回填独立回复台账。
+ * reply_message 只是计划中的回复文本，不能单独证明发送成功，因此只信 reply_count。
+ */
+export function getRepliedCommentRows() {
+  const db = getDb();
+  return db
+    .prepare(
+      `
+    SELECT work_title, username, comment_text, reply_message, comment_time, reply_count
+    FROM comments
+    WHERE reply_count > 0
+    ORDER BY id ASC
+  `
+    )
+    .all();
+}
+
+/**
  * 批量查询一组用户名的历史评论（跨所有作品），不含回复内容。
  * 返回 Map，key 为 username，value 为 [{date, text, work}] 按时间倒序。
  *

@@ -204,7 +204,12 @@ export function summarizeCommentsForLog(comments, limit = 3) {
 }
 
 export function sanitizeCollectedComment(comment) {
-  const { signature, domIndex, order, ...rest } = comment;
+  const rest = { ...comment };
+  delete rest.signature;
+  delete rest.domIndex;
+  delete rest.order;
+  delete rest.hasReplies;
+  delete rest.replyCount;
 
   return rest;
 }
